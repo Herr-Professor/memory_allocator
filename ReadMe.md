@@ -1,4 +1,4 @@
-This is still a work in progress but here's what I am trying to build;
+This is a work in progress;
 
 # Custom Memory Allocator
 
