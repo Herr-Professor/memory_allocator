@@ -70,36 +70,52 @@ STL-compatible allocator template:
 - Integration with thread-local memory pools
 - Exception safety
 
-## Usage Examples
+## Tests
 
-### Basic Allocation
-```cpp
-MemoryPool pool;
-void* ptr = pool.allocate(1024);  // Allocate 1024 bytes
-pool.deallocate(ptr);             // Free the memory
-```
+### Basic Memory Operations (test1.cpp)
+A simple test that demonstrates basic memory pool operations:
+- Single block allocation and deallocation
+- Memory reuse verification
+- Basic cleanup operations
 
-### Scope-Based Memory Management
-```cpp
-MemoryPool pool;
-pool.begin_scope();
-// Allocations in this scope
-void* ptr1 = pool.allocate(512);
-void* ptr2 = pool.allocate(1024);
-pool.end_scope();  // Automatically frees ptr1 and ptr2
-```
+### Stress Test (test2.cpp)
+A comprehensive stress test that validates:
+- Large-scale allocations (1000 initial blocks)
+- Random allocation patterns (5000 operations)
+- Memory reuse efficiency
+- Variable block sizes (16-256 bytes)
+- Three types of operations:
+  - New allocations (A)
+  - Deallocations (D)
+  - Reallocations (R)
+- Memory statistics tracking
+- Proper cleanup of all allocated blocks
 
-### STL Container Integration
-```cpp
-std::vector<int, CustomAllocator<int>> vec;
-vec.push_back(42);  // Uses custom allocator
-```
+The stress test provides visual feedback of operations and periodic statistics reporting, helping identify potential issues with:
+- Memory fragmentation
+- Memory leaks
+- Free list management
+- Memory reuse efficiency
+- Thread safety
 
-### Fixed-Size Allocations
-```cpp
-void* small = pool.allocate(32, AllocationStrategy::FIXED_SIZE);   // Uses small allocator
-void* medium = pool.allocate(128, AllocationStrategy::FIXED_SIZE); // Uses medium allocator
-```
+### Performance Comparison Test (test3.cpp)
+A comprehensive benchmark that:
+- Compares MemoryPool against standard malloc/free
+- Performs 10,000 initial allocations
+- Executes 50,000 random operations
+- Tracks and visualizes:
+  - Memory usage with ASCII progress bars
+  - Real-time allocation (R) and deallocation (D) operations
+  - Peak memory usage
+  - Total execution time
+  - Average operation time
+  - Allocation/deallocation counts
+
+The test helps identify:
+- Performance differences between allocators
+- Memory usage patterns
+- Memory fragmentation effects
+- Allocation/deallocation efficiency
 
 ## Best Practices
 

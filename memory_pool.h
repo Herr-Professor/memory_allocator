@@ -26,6 +26,7 @@ struct AllocationStats {
     }
     
     static void print_stats() {
+        merge_thread_stats();
         std::cout << "Total allocations: " << total_allocations 
                   << "\nTotal bytes: " << total_bytes << std::endl;
     }
