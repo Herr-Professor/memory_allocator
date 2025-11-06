@@ -4,200 +4,586 @@
 thread_local size_t AllocationStats::allocations = 0;
 thread_local size_t AllocationStats::deallocations = 0;
 thread_local size_t AllocationStats::bytes_allocated = 0;
+thread_local size_t AllocationStats::last_reported_bytes = 0;
 std::atomic<size_t> AllocationStats::total_allocations{0};
+std::atomic<size_t> AllocationStats::total_deallocations{0};
 std::atomic<size_t> AllocationStats::total_bytes{0};
 
-MemoryPool global_pool;
+#if ENABLE_ALLOC_TIMING
+thread_local uint64_t AllocationTimingStats::overall_ns = 0;
+thread_local uint64_t AllocationTimingStats::best_fit_ns = 0;
+thread_local uint64_t AllocationTimingStats::pool_ns = 0;
+thread_local uint64_t AllocationTimingStats::segregated_ns = 0;
+thread_local uint64_t AllocationTimingStats::segregated_refill_ns = 0;
+thread_local uint64_t AllocationTimingStats::fixed32_ns = 0;
+thread_local uint64_t AllocationTimingStats::fixed128_ns = 0;
+thread_local uint64_t AllocationTimingStats::dealloc_ns = 0;
+
+thread_local size_t AllocationTimingStats::overall_count = 0;
+thread_local size_t AllocationTimingStats::best_fit_count = 0;
+thread_local size_t AllocationTimingStats::pool_count = 0;
+thread_local size_t AllocationTimingStats::segregated_count = 0;
+thread_local size_t AllocationTimingStats::segregated_refill_count = 0;
+thread_local size_t AllocationTimingStats::fixed32_count = 0;
+thread_local size_t AllocationTimingStats::fixed128_count = 0;
+thread_local size_t AllocationTimingStats::dealloc_count = 0;
+
+std::atomic<uint64_t> AllocationTimingStats::total_overall_ns{0};
+std::atomic<uint64_t> AllocationTimingStats::total_best_fit_ns{0};
+std::atomic<uint64_t> AllocationTimingStats::total_pool_ns{0};
+std::atomic<uint64_t> AllocationTimingStats::total_segregated_ns{0};
+std::atomic<uint64_t> AllocationTimingStats::total_segregated_refill_ns{0};
+std::atomic<uint64_t> AllocationTimingStats::total_fixed32_ns{0};
+std::atomic<uint64_t> AllocationTimingStats::total_fixed128_ns{0};
+std::atomic<uint64_t> AllocationTimingStats::total_dealloc_ns{0};
+
+std::atomic<size_t> AllocationTimingStats::total_overall_count{0};
+std::atomic<size_t> AllocationTimingStats::total_best_fit_count{0};
+std::atomic<size_t> AllocationTimingStats::total_pool_count{0};
+std::atomic<size_t> AllocationTimingStats::total_segregated_count{0};
+std::atomic<size_t> AllocationTimingStats::total_segregated_refill_count{0};
+std::atomic<size_t> AllocationTimingStats::total_fixed32_count{0};
+std::atomic<size_t> AllocationTimingStats::total_fixed128_count{0};
+std::atomic<size_t> AllocationTimingStats::total_dealloc_count{0};
+
+void AllocationTimingStats::record(TimingCategory category, uint64_t ns) {
+    switch (category) {
+        case TimingCategory::OverallAllocate:
+            overall_ns += ns;
+            overall_count += 1;
+            break;
+        case TimingCategory::BestFit:
+            best_fit_ns += ns;
+            best_fit_count += 1;
+            break;
+        case TimingCategory::PoolBased:
+            pool_ns += ns;
+            pool_count += 1;
+            break;
+        case TimingCategory::Segregated:
+            segregated_ns += ns;
+            segregated_count += 1;
+            break;
+        case TimingCategory::SegregatedRefill:
+            segregated_refill_ns += ns;
+            segregated_refill_count += 1;
+            break;
+        case TimingCategory::Fixed32:
+            fixed32_ns += ns;
+            fixed32_count += 1;
+            break;
+        case TimingCategory::Fixed128:
+            fixed128_ns += ns;
+            fixed128_count += 1;
+            break;
+        case TimingCategory::Deallocate:
+            dealloc_ns += ns;
+            dealloc_count += 1;
+            break;
+    }
+}
+
+void AllocationTimingStats::merge_thread_stats() {
+    total_overall_ns.fetch_add(overall_ns, std::memory_order_relaxed);
+    total_best_fit_ns.fetch_add(best_fit_ns, std::memory_order_relaxed);
+    total_pool_ns.fetch_add(pool_ns, std::memory_order_relaxed);
+    total_segregated_ns.fetch_add(segregated_ns, std::memory_order_relaxed);
+    total_segregated_refill_ns.fetch_add(segregated_refill_ns, std::memory_order_relaxed);
+    total_fixed32_ns.fetch_add(fixed32_ns, std::memory_order_relaxed);
+    total_fixed128_ns.fetch_add(fixed128_ns, std::memory_order_relaxed);
+    total_dealloc_ns.fetch_add(dealloc_ns, std::memory_order_relaxed);
+
+    total_overall_count.fetch_add(overall_count, std::memory_order_relaxed);
+    total_best_fit_count.fetch_add(best_fit_count, std::memory_order_relaxed);
+    total_pool_count.fetch_add(pool_count, std::memory_order_relaxed);
+    total_segregated_count.fetch_add(segregated_count, std::memory_order_relaxed);
+    total_segregated_refill_count.fetch_add(segregated_refill_count, std::memory_order_relaxed);
+    total_fixed32_count.fetch_add(fixed32_count, std::memory_order_relaxed);
+    total_fixed128_count.fetch_add(fixed128_count, std::memory_order_relaxed);
+    total_dealloc_count.fetch_add(dealloc_count, std::memory_order_relaxed);
+
+    overall_ns = best_fit_ns = pool_ns = segregated_ns = segregated_refill_ns = 0;
+    fixed32_ns = fixed128_ns = dealloc_ns = 0;
+
+    overall_count = best_fit_count = pool_count = segregated_count = segregated_refill_count = 0;
+    fixed32_count = fixed128_count = dealloc_count = 0;
+}
+
+void AllocationTimingStats::print_stats() {
+    merge_thread_stats();
+    auto print_line = [](const char* label, uint64_t total_ns, size_t count) {
+        if (count == 0) {
+            std::cout << label << ": count=0 total_ns=0 avg_ns=0" << std::endl;
+            return;
+        }
+        double avg = static_cast<double>(total_ns) / static_cast<double>(count);
+        std::cout << label << ": count=" << count
+                  << " total_ns=" << total_ns
+                  << " avg_ns=" << avg << std::endl;
+    };
+
+    print_line("Overall allocate", total_overall_ns.load(std::memory_order_relaxed),
+               total_overall_count.load(std::memory_order_relaxed));
+    print_line("Best fit", total_best_fit_ns.load(std::memory_order_relaxed),
+               total_best_fit_count.load(std::memory_order_relaxed));
+    print_line("Pool based", total_pool_ns.load(std::memory_order_relaxed),
+               total_pool_count.load(std::memory_order_relaxed));
+    print_line("Segregated allocate", total_segregated_ns.load(std::memory_order_relaxed),
+               total_segregated_count.load(std::memory_order_relaxed));
+    print_line("Segregated refill", total_segregated_refill_ns.load(std::memory_order_relaxed),
+               total_segregated_refill_count.load(std::memory_order_relaxed));
+    print_line("Fixed 32 allocate", total_fixed32_ns.load(std::memory_order_relaxed),
+               total_fixed32_count.load(std::memory_order_relaxed));
+    print_line("Fixed 128 allocate", total_fixed128_ns.load(std::memory_order_relaxed),
+               total_fixed128_count.load(std::memory_order_relaxed));
+    print_line("Deallocate", total_dealloc_ns.load(std::memory_order_relaxed),
+               total_dealloc_count.load(std::memory_order_relaxed));
+}
+#endif
+thread_local MemoryPool global_pool(false);
+thread_local MemoryPool::ThreadLocalCache MemoryPool::thread_cache{};
 
 void* MemoryPool::allocate_best_fit(size_t size) {
-    MemoryBlock* best_fit = nullptr;
-    MemoryBlock* best_fit_prev = nullptr;
-    MemoryBlock* current = free_list;
-    MemoryBlock* prev = nullptr;
-    
-    while (current) {
-        if (current->is_free && current->size >= size && 
-            (!best_fit || current->size < best_fit->size)) {
-            best_fit = current;
-            best_fit_prev = prev;
+    ScopedTiming timing(TimingCategory::BestFit);
+    auto it = size_index.lower_bound(size);
+    if (it == size_index.end()) {
+        add_new_chunk();
+        it = size_index.lower_bound(size);
+        if (it == size_index.end()) {
+            return nullptr;
         }
-        prev = current;
-        current = current->next;
     }
-    
-    if (best_fit) {
-        if (best_fit->size > size + sizeof(MemoryBlock)) {
-            MemoryBlock* new_block = MemoryBlock::init(
-                best_fit->data() + size, 
-                best_fit->size - size - sizeof(MemoryBlock),
-                AllocationStrategy::BEST_FIT
-            );
-            new_block->next = best_fit->next;
-            best_fit->next = new_block;
-            best_fit->size = size;
-        }
-        
-        best_fit->is_free = false;
-        if (best_fit_prev) {
-            best_fit_prev->next = best_fit->next;
-        } else {
-            free_list = best_fit->next;
-        }
-        
-        AllocationStats::allocations++;
-        AllocationStats::bytes_allocated += best_fit->size;
-        return best_fit->data();
+
+    MemoryBlock* block = it->second;
+    detach_free_block(block);
+
+    constexpr size_t MIN_SPLIT_PAYLOAD = 32;
+    if (block->size >= size + sizeof(MemoryBlock) + MIN_SPLIT_PAYLOAD) {
+        size_t remainder_total = block->size - size;
+        MemoryBlock* remainder = MemoryBlock::init(
+            block->data() + size,
+            remainder_total,
+            AllocationStrategy::BEST_FIT
+        );
+        block->size = size;
+        insert_free_block(remainder);
     }
-    
-    add_new_chunk();
-    return allocate_best_fit(size);
+
+    block->is_free = false;
+    block->strategy = static_cast<uint8_t>(AllocationStrategy::BEST_FIT);
+
+    AllocationStats::allocations++;
+    AllocationStats::bytes_allocated += block->size;
+    return block->data();
 }
 
 void* MemoryPool::allocate_from_pool(size_t size) {
-    MemoryBlock* best_fit = nullptr;
-    MemoryBlock* prev = nullptr;
-    MemoryBlock* current = free_list;
-    
-    while (current) {
-        if (current->is_free && current->size >= size) {
-            best_fit = current;
-            prev = current;
-            break;
+    ScopedTiming timing(TimingCategory::PoolBased);
+    auto it = size_index.lower_bound(size);
+    if (it == size_index.end()) {
+        add_new_chunk();
+        it = size_index.lower_bound(size);
+        if (it == size_index.end()) {
+            return nullptr;
         }
-        current = current->next;
     }
-    
-    if (best_fit) {
-        best_fit->is_free = false;
-        if (prev) {
-            prev->next = best_fit->next;
-        } else {
-            free_list = best_fit->next;
-        }
-        
-        AllocationStats::allocations++;
-        AllocationStats::bytes_allocated += best_fit->size;
-        return best_fit->data();
-    }
-    
-    add_new_chunk();
-    return allocate_from_pool(size);
+
+    MemoryBlock* block = it->second;
+    detach_free_block(block);
+
+    block->is_free = false;
+    block->strategy = static_cast<uint8_t>(AllocationStrategy::POOL_BASED);
+
+    AllocationStats::allocations++;
+    AllocationStats::bytes_allocated += block->size;
+    return block->data();
 }
 
 void* MemoryPool::allocate_segregated(size_t size) {
-    // Define size classes (powers of 2 for simplicity)
-    static const size_t SIZE_CLASSES[] = {
-        32, 64, 128, 256, 512, 1024, 2048, 4096
-    };
-    
-    // Find appropriate size class
-    size_t class_size = SIZE_CLASSES[0];
-    for (size_t s : SIZE_CLASSES) {
-        if (s >= size) {
-            class_size = s;
-            break;
-        }
+    ScopedTiming timing(TimingCategory::Segregated);
+    const size_t class_index = select_segregated_class(size);
+    if (class_index == SEGREGATED_CLASS_COUNT) {
+        return allocate_best_fit(size);
     }
-    
-    // Try to find a block in the appropriate free list
-    MemoryBlock* current = free_list;
-    MemoryBlock* prev = nullptr;
-    
-    while (current) {
-        if (current->is_free && current->size == class_size) {
-            // Found a perfect fit
-            current->is_free = false;
-            
-            // Remove from free list
-            if (prev) {
-                prev->next = current->next;
-            } else {
-                free_list = current->next;
-            }
-            
-            AllocationStats::allocations++;
-            AllocationStats::bytes_allocated += class_size;
-            return current->data();
-        }
-        prev = current;
-        current = current->next;
+
+    if (!segregated_free_lists[class_index]) {
+        replenish_segregated_class(class_index);
     }
-    
-    // No suitable block found, allocate new chunk
-    add_new_chunk();
-    
-    // Split the new chunk into blocks of the appropriate size
-    char* chunk = memory_chunks.back();
-    size_t remaining = POOL_SIZE;
-    
-    while (remaining >= class_size + sizeof(MemoryBlock)) {
-        MemoryBlock* new_block = MemoryBlock::init(
-            chunk, 
-            class_size,
-            AllocationStrategy::SEGREGATED
-        );
-        
-        // Add to free list
-        new_block->next = free_list;
-        free_list = new_block;
-        
-        chunk += class_size + sizeof(MemoryBlock);
-        remaining -= class_size + sizeof(MemoryBlock);
+
+    MemoryBlock* block = segregated_free_lists[class_index];
+    if (!block) {
+        return allocate_best_fit(size);
     }
-    
-    // Try allocation again with the new blocks
-    return allocate_segregated(size);
+
+    segregated_free_lists[class_index] = block->next;
+    block->next = nullptr;
+    block->prev = nullptr;
+    block->is_free = false;
+    block->strategy = static_cast<uint8_t>(AllocationStrategy::SEGREGATED);
+
+    AllocationStats::allocations++;
+    AllocationStats::bytes_allocated += block->size;
+    return block->data();
 }
 
 void MemoryPool::deallocate_block(MemoryBlock* block) {
     if (!block) return;
     
-    // Mark block as free
-    block->is_free = true;
-    block->next = nullptr;  // Important: clear the next pointer
-    
-    // Handle empty free list case
-    if (!free_list) {
-        free_list = block;
-        return;
+    size_t freed_size = block->size;
+    insert_free_block(block);
+
+    AllocationStats::deallocations++;
+    if (AllocationStats::bytes_allocated >= freed_size) {
+        AllocationStats::bytes_allocated -= freed_size;
+    } else {
+        AllocationStats::bytes_allocated = 0;
     }
-    
-    // Find the correct position to insert the block
-    MemoryBlock* current = free_list;
+}
+
+void MemoryPool::insert_free_block(MemoryBlock* block, AllocationStrategy strat, bool allow_coalesce) {
+    if (!block) return;
+
+    block->is_free = true;
+    block->strategy = static_cast<uint8_t>(strat);
+
     MemoryBlock* prev = nullptr;
-    
-    // Find the correct position in address order
+    MemoryBlock* current = free_list;
+
     while (current && current < block) {
         prev = current;
         current = current->next;
     }
-    
-    // Insert the block
+
+    block->prev = prev;
+    block->next = current;
+    if (current) {
+        current->prev = block;
+    }
     if (prev) {
         prev->next = block;
     } else {
         free_list = block;
     }
-    block->next = current;
-    
-    // Coalesce with next block if possible
-    if (current && 
-        reinterpret_cast<char*>(block) + block->size + sizeof(MemoryBlock) == 
-        reinterpret_cast<char*>(current) && 
-        current->is_free) {
-        block->size += current->size + sizeof(MemoryBlock);
-        block->next = current->next;
+
+    add_to_size_index(block);
+
+    if (allow_coalesce && strat == AllocationStrategy::BEST_FIT) {
+        coalesce_neighbors(block);
     }
-    
-    // Coalesce with previous block if possible
-    if (prev && 
-        reinterpret_cast<char*>(prev) + prev->size + sizeof(MemoryBlock) == 
-        reinterpret_cast<char*>(block) && 
-        prev->is_free) {
-        prev->size += block->size + sizeof(MemoryBlock);
-        prev->next = block->next;
+}
+
+void MemoryPool::detach_free_block(MemoryBlock* block) {
+    if (!block) return;
+
+    remove_from_size_index(block);
+
+    MemoryBlock* prev = block->prev;
+    MemoryBlock* next = block->next;
+
+    if (prev) {
+        prev->next = next;
+    } else if (free_list == block) {
+        free_list = next;
     }
-    
-    AllocationStats::deallocations++;
-    AllocationStats::bytes_allocated -= block->size;
+
+    if (next) {
+        next->prev = prev;
+    }
+
+    block->prev = nullptr;
+    block->next = nullptr;
+    block->is_free = false;
+}
+
+void MemoryPool::coalesce_neighbors(MemoryBlock* block) {
+    if (!block) return;
+
+    if (static_cast<AllocationStrategy>(block->strategy) != AllocationStrategy::BEST_FIT) {
+        return;
+    }
+
+    remove_from_size_index(block);
+
+    MemoryBlock* current = block;
+
+    MemoryBlock* next = current->next;
+    if (next &&
+        next->is_free &&
+        static_cast<AllocationStrategy>(next->strategy) == AllocationStrategy::BEST_FIT &&
+        reinterpret_cast<char*>(current) + sizeof(MemoryBlock) + current->size ==
+            reinterpret_cast<char*>(next)) {
+        remove_from_size_index(next);
+        current->size += next->size + sizeof(MemoryBlock);
+        current->next = next->next;
+        if (next->next) {
+            next->next->prev = current;
+        }
+    }
+
+    MemoryBlock* prev = current->prev;
+    if (prev &&
+        prev->is_free &&
+        static_cast<AllocationStrategy>(prev->strategy) == AllocationStrategy::BEST_FIT &&
+        reinterpret_cast<char*>(prev) + sizeof(MemoryBlock) + prev->size ==
+            reinterpret_cast<char*>(current)) {
+        remove_from_size_index(prev);
+        prev->size += current->size + sizeof(MemoryBlock);
+        prev->next = current->next;
+        if (current->next) {
+            current->next->prev = prev;
+        }
+        current = prev;
+    }
+
+    add_to_size_index(current);
+}
+
+void MemoryPool::add_to_size_index(MemoryBlock* block) {
+    if (!block) return;
+    auto iter = size_index.emplace(block->size, block);
+    size_lookup[block] = iter;
+}
+
+void MemoryPool::remove_from_size_index(MemoryBlock* block) {
+    if (!block) return;
+
+    auto lookup = size_lookup.find(block);
+    if (lookup != size_lookup.end()) {
+        size_index.erase(lookup->second);
+        size_lookup.erase(lookup);
+    }
+}
+
+MemoryBlock* MemoryPool::ptr_to_block(void* ptr) {
+    return reinterpret_cast<MemoryBlock*>(reinterpret_cast<char*>(ptr) - sizeof(MemoryBlock));
+}
+
+void* MemoryPool::acquire_small_from_cache(ThreadLocalCache& cache) {
+    if (cache.small_blocks.empty()) {
+        refill_small_cache(cache);
+        if (cache.small_blocks.empty()) {
+            return small_allocator.allocate();
+        }
+    }
+    if (!cache.small_blocks.empty()) {
+        void* ptr = cache.small_blocks.back();
+        cache.small_blocks.pop_back();
+        MemoryBlock* block = ptr_to_block(ptr);
+        block->is_free = false;
+        block->next = nullptr;
+        block->prev = nullptr;
+        block->strategy = static_cast<uint8_t>(AllocationStrategy::FIXED_SIZE);
+        AllocationStats::allocations++;
+        AllocationStats::bytes_allocated += block->size;
+        return ptr;
+    }
+    return nullptr;
+}
+
+void* MemoryPool::acquire_medium_from_cache(ThreadLocalCache& cache) {
+    if (cache.medium_blocks.empty()) {
+        refill_medium_cache(cache);
+        if (cache.medium_blocks.empty()) {
+            return medium_allocator.allocate();
+        }
+    }
+    if (!cache.medium_blocks.empty()) {
+        void* ptr = cache.medium_blocks.back();
+        cache.medium_blocks.pop_back();
+        MemoryBlock* block = ptr_to_block(ptr);
+        block->is_free = false;
+        block->next = nullptr;
+        block->prev = nullptr;
+        block->strategy = static_cast<uint8_t>(AllocationStrategy::FIXED_SIZE);
+        AllocationStats::allocations++;
+        AllocationStats::bytes_allocated += block->size;
+        return ptr;
+    }
+    return nullptr;
+}
+
+void* MemoryPool::acquire_large_from_cache(ThreadLocalCache& cache) {
+    if (cache.large_blocks.empty()) {
+        refill_large_cache(cache);
+        if (cache.large_blocks.empty()) {
+            return large_allocator.allocate();
+        }
+    }
+    if (!cache.large_blocks.empty()) {
+        void* ptr = cache.large_blocks.back();
+        cache.large_blocks.pop_back();
+        MemoryBlock* block = ptr_to_block(ptr);
+        block->is_free = false;
+        block->next = nullptr;
+        block->prev = nullptr;
+        block->strategy = static_cast<uint8_t>(AllocationStrategy::FIXED_SIZE);
+        AllocationStats::allocations++;
+        AllocationStats::bytes_allocated += block->size;
+        return ptr;
+    }
+    return nullptr;
+}
+
+bool MemoryPool::release_small_to_cache(ThreadLocalCache& cache, void* ptr) {
+    if (cache.small_blocks.size() < SMALL_CACHE_LIMIT) {
+        MemoryBlock* block = ptr_to_block(ptr);
+        block->is_free = true;
+        block->next = nullptr;
+        block->prev = nullptr;
+        cache.small_blocks.push_back(ptr);
+        AllocationStats::deallocations++;
+        if (AllocationStats::bytes_allocated >= block->size) {
+            AllocationStats::bytes_allocated -= block->size;
+        } else {
+            AllocationStats::bytes_allocated = 0;
+        }
+        return true;
+    }
+    small_allocator.deallocate(ptr);
+    return true;
+}
+
+bool MemoryPool::release_medium_to_cache(ThreadLocalCache& cache, void* ptr) {
+    if (cache.medium_blocks.size() < MEDIUM_CACHE_LIMIT) {
+        MemoryBlock* block = ptr_to_block(ptr);
+        block->is_free = true;
+        block->next = nullptr;
+        block->prev = nullptr;
+        cache.medium_blocks.push_back(ptr);
+        AllocationStats::deallocations++;
+        if (AllocationStats::bytes_allocated >= block->size) {
+            AllocationStats::bytes_allocated -= block->size;
+        } else {
+            AllocationStats::bytes_allocated = 0;
+        }
+        return true;
+    }
+    medium_allocator.deallocate(ptr);
+    return true;
+}
+
+bool MemoryPool::release_large_to_cache(ThreadLocalCache& cache, void* ptr) {
+    if (cache.large_blocks.size() < LARGE_CACHE_LIMIT) {
+        MemoryBlock* block = ptr_to_block(ptr);
+        block->is_free = true;
+        block->next = nullptr;
+        block->prev = nullptr;
+        cache.large_blocks.push_back(ptr);
+        AllocationStats::deallocations++;
+        if (AllocationStats::bytes_allocated >= block->size) {
+            AllocationStats::bytes_allocated -= block->size;
+        } else {
+            AllocationStats::bytes_allocated = 0;
+        }
+        return true;
+    }
+    large_allocator.deallocate(ptr);
+    return true;
+}
+
+void MemoryPool::refill_small_cache(ThreadLocalCache& cache) {
+    constexpr size_t REFILL_BATCH = 64;
+    for (size_t i = 0; i < REFILL_BATCH && cache.small_blocks.size() < SMALL_CACHE_LIMIT; ++i) {
+        void* ptr = small_allocator.allocate();
+        if (!ptr) {
+            break;
+        }
+        MemoryBlock* block = ptr_to_block(ptr);
+        if (AllocationStats::allocations > 0) {
+            AllocationStats::allocations--;
+        }
+        if (AllocationStats::bytes_allocated >= block->size) {
+            AllocationStats::bytes_allocated -= block->size;
+        } else {
+            AllocationStats::bytes_allocated = 0;
+        }
+        cache.small_blocks.push_back(ptr);
+    }
+}
+
+void MemoryPool::refill_medium_cache(ThreadLocalCache& cache) {
+    constexpr size_t REFILL_BATCH = 32;
+    for (size_t i = 0; i < REFILL_BATCH && cache.medium_blocks.size() < MEDIUM_CACHE_LIMIT; ++i) {
+        void* ptr = medium_allocator.allocate();
+        if (!ptr) {
+            break;
+        }
+        MemoryBlock* block = ptr_to_block(ptr);
+        if (AllocationStats::allocations > 0) {
+            AllocationStats::allocations--;
+        }
+        if (AllocationStats::bytes_allocated >= block->size) {
+            AllocationStats::bytes_allocated -= block->size;
+        } else {
+            AllocationStats::bytes_allocated = 0;
+        }
+        cache.medium_blocks.push_back(ptr);
+    }
+}
+
+void MemoryPool::refill_large_cache(ThreadLocalCache& cache) {
+    constexpr size_t REFILL_BATCH = 32;
+    for (size_t i = 0; i < REFILL_BATCH && cache.large_blocks.size() < LARGE_CACHE_LIMIT; ++i) {
+        void* ptr = large_allocator.allocate();
+        if (!ptr) {
+            break;
+        }
+        MemoryBlock* block = ptr_to_block(ptr);
+        if (AllocationStats::allocations > 0) {
+            AllocationStats::allocations--;
+        }
+        if (AllocationStats::bytes_allocated >= block->size) {
+            AllocationStats::bytes_allocated -= block->size;
+        } else {
+            AllocationStats::bytes_allocated = 0;
+        }
+        cache.large_blocks.push_back(ptr);
+    }
+}
+
+size_t MemoryPool::select_segregated_class(size_t size) {
+    for (size_t index = 0; index < SEGREGATED_CLASS_COUNT; ++index) {
+        if (SEGREGATED_CLASS_SIZES[index] >= size) {
+            return index;
+        }
+    }
+    return SEGREGATED_CLASS_COUNT;
+}
+
+void MemoryPool::replenish_segregated_class(size_t class_index) {
+    if (class_index >= SEGREGATED_CLASS_COUNT) {
+        return;
+    }
+
+    ScopedTiming timing(TimingCategory::SegregatedRefill);
+
+    add_new_chunk();
+    MemoryBlock* chunk_block = reinterpret_cast<MemoryBlock*>(memory_chunks.back());
+    detach_free_block(chunk_block);
+
+    const size_t class_size = SEGREGATED_CLASS_SIZES[class_index];
+    size_t total_bytes = chunk_block->size + sizeof(MemoryBlock);
+    char* cursor = reinterpret_cast<char*>(chunk_block);
+
+    MemoryBlock* head = segregated_free_lists[class_index];
+
+    while (total_bytes >= class_size + sizeof(MemoryBlock)) {
+        MemoryBlock* new_block = MemoryBlock::init(
+            cursor,
+            class_size + sizeof(MemoryBlock),
+            AllocationStrategy::SEGREGATED
+        );
+        new_block->next = head;
+        new_block->prev = nullptr;
+        head = new_block;
+        cursor += class_size + sizeof(MemoryBlock);
+        total_bytes -= class_size + sizeof(MemoryBlock);
+    }
+
+    segregated_free_lists[class_index] = head;
+
+    if (total_bytes > sizeof(MemoryBlock)) {
+        MemoryBlock* remainder = MemoryBlock::init(cursor, total_bytes);
+        insert_free_block(remainder);
+    }
 }

@@ -3,7 +3,7 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
-#include <malloc.h>
+#include <cstdlib>
 #include "../memory_pool.h"
 
 struct AllocationRecord {
@@ -209,6 +209,11 @@ int main() {
         pool_results.deallocations, std_results.deallocations,
         pool_results.avg_time, std_results.avg_time
     );
+    
+#if ENABLE_ALLOC_TIMING
+    std::cout << "\nTiming Breakdown (Memory Pool):\n";
+    AllocationTimingStats::print_stats();
+#endif
     
     return 0;
 } 
