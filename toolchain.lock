@@ -1,0 +1,3 @@
+CXX=clang++-17
+CXXFLAGS=-O3 -std=c++17 -pthread -march=native
+PYTHON=3.11

@@ -1,0 +1,48 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Test binaries
+test1
+test2
+test3
+main
+
+# Benchmark results
+bench/results/
+bench/plots/*.png
+bench/plots/*.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# CMake (if ever added)
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Profiling
+*.prof
+*.profdata
+*.profraw

@@ -24,6 +24,18 @@
 #define ENABLE_ALLOC_TIMING 0
 #endif
 
+#ifndef MEMPOOL_SHARDED_SEGREGATED
+#define MEMPOOL_SHARDED_SEGREGATED 0
+#endif
+
+#ifndef MEMPOOL_POINTER_GUARD
+#ifdef NDEBUG
+#define MEMPOOL_POINTER_GUARD 0
+#else
+#define MEMPOOL_POINTER_GUARD 1
+#endif
+#endif
+
 // Statistics tracking for memory allocations
 struct AllocationStats {
     static thread_local size_t allocations;
@@ -191,6 +203,7 @@ public:
 template<size_t BlockSize>
 class FixedSizeAllocator {
     static constexpr size_t BLOCK_SIZE = BlockSize;
+    static constexpr size_t CHUNK_SIZE = 64 * 1024;  // 64KB chunks
     std::vector<char*> memory_chunks;
     MemoryBlock* free_list;
     std::mutex mutex;
@@ -245,9 +258,55 @@ public:
         }
     }
 
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto chunk : memory_chunks) {
+            delete[] chunk;
+        }
+        memory_chunks.clear();
+        free_list = nullptr;
+        add_new_chunk();
+    }
+
+    void* allocate_raw() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!free_list) {
+            add_new_chunk();
+        }
+
+        MemoryBlock* block = free_list;
+        free_list = free_list->next;
+        block->is_free = false;
+        block->strategy = static_cast<uint8_t>(AllocationStrategy::FIXED_SIZE);
+        return block->data();
+    }
+
+    void deallocate_raw(void* ptr) {
+        if (!ptr) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        MemoryBlock* block = reinterpret_cast<MemoryBlock*>(
+            reinterpret_cast<char*>(ptr) - sizeof(MemoryBlock)
+        );
+        block->is_free = true;
+        block->next = free_list;
+        free_list = block;
+    }
+
+    bool owns(void* ptr) {
+        if (!ptr) return false;
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto chunk : memory_chunks) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(chunk);
+            if (addr >= base && addr < base + CHUNK_SIZE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 private:
     void add_new_chunk() {
-        static constexpr size_t CHUNK_SIZE = 64 * 1024;  // 64KB chunks
         char* chunk = new char[CHUNK_SIZE];
         memory_chunks.push_back(chunk);
         
@@ -292,6 +351,7 @@ class MemoryPool {
     inline static constexpr std::array<size_t, 8> SEGREGATED_CLASS_SIZES{{32, 64, 128, 256, 512, 1024, 2048, 4096}};
     inline static constexpr size_t SEGREGATED_CLASS_COUNT = SEGREGATED_CLASS_SIZES.size();
     std::array<MemoryBlock*, SEGREGATED_CLASS_COUNT> segregated_free_lists{};
+    std::array<std::mutex, SEGREGATED_CLASS_COUNT> segregated_mutexes{};
 
 public:
     explicit MemoryPool(bool thread_safe = true)
@@ -382,6 +442,16 @@ public:
                 return fixed_result;
             }
         }
+
+        #if MEMPOOL_SHARDED_SEGREGATED
+        if (effective_strategy == AllocationStrategy::SEGREGATED &&
+            thread_safe &&
+            active_scope_count.load(std::memory_order_relaxed) == 0) {
+            if (void* fast = allocate_segregated_fast(aligned_size)) {
+                return fast;
+            }
+        }
+        #endif
         
         std::unique_lock<std::mutex> lock(mutex, std::defer_lock);
         if (thread_safe) lock.lock();
@@ -410,17 +480,89 @@ public:
         
         return result;
     }
+
+    void* allocate_aligned(size_t size, size_t alignment,
+                           AllocationStrategy strategy = AllocationStrategy::BEST_FIT) {
+        if (alignment < 16) {
+            alignment = 16;
+        }
+        if (alignment == 0) {
+            return nullptr;
+        }
+        if ((alignment & (alignment - 1)) != 0) {
+            size_t rounded = 1;
+            while (rounded < alignment) {
+                if (rounded > (std::numeric_limits<size_t>::max() >> 1)) {
+                    return nullptr;
+                }
+                rounded <<= 1;
+            }
+            alignment = rounded;
+        }
+
+        if (size > std::numeric_limits<size_t>::max() - alignment - sizeof(void*)) {
+            return nullptr;
+        }
+        const size_t total = size + alignment + sizeof(void*);
+        void* raw = allocate(total, strategy);
+        if (!raw) {
+            return nullptr;
+        }
+
+        const uintptr_t raw_value = reinterpret_cast<uintptr_t>(raw);
+        if (raw_value > std::numeric_limits<uintptr_t>::max() - sizeof(void*)) {
+            deallocate(raw);
+            return nullptr;
+        }
+        uintptr_t raw_addr = raw_value + sizeof(void*);
+        if (raw_addr > std::numeric_limits<uintptr_t>::max() - (alignment - 1)) {
+            deallocate(raw);
+            return nullptr;
+        }
+        uintptr_t aligned_addr = (raw_addr + alignment - 1) & ~(alignment - 1);
+        void* aligned_ptr = reinterpret_cast<void*>(aligned_addr);
+        reinterpret_cast<void**>(aligned_ptr)[-1] = raw;
+        return aligned_ptr;
+    }
+
+    void deallocate_aligned(void* aligned_ptr) {
+        if (!aligned_ptr) {
+            return;
+        }
+        void* raw = reinterpret_cast<void**>(aligned_ptr)[-1];
+        deallocate(raw);
+    }
+
+    static size_t usable_size(void* ptr) {
+        if (!ptr) {
+            return 0;
+        }
+        MemoryBlock* block = ptr_to_block(ptr);
+        return block ? block->size : 0;
+    }
     
     void deallocate(void* ptr) {
         if (!ptr) return;
         
         ScopedTiming timing(TimingCategory::Deallocate);
-        MemoryBlock* block = ptr_to_block(ptr);
-
-        bool need_scope_handling = thread_safe && active_scope_count.load(std::memory_order_relaxed) > 0;
+        const bool has_scope = active_scope_count.load(std::memory_order_relaxed) > 0;
         std::unique_lock<std::mutex> lock(mutex, std::defer_lock);
-        if (need_scope_handling) {
+        if (thread_safe && (has_scope || MEMPOOL_POINTER_GUARD)) {
             lock.lock();
+        }
+
+        #if MEMPOOL_POINTER_GUARD
+        if (!owns_ptr(ptr)) {
+            return;
+        }
+        #endif
+
+        MemoryBlock* block = ptr_to_block(ptr);
+        if (!block) {
+            return;
+        }
+
+        if (has_scope) {
 
             auto scope_it = scope_lookup.find(ptr);
             if (scope_it != scope_lookup.end()) {
@@ -441,7 +583,39 @@ public:
             }
         }
 
+        if (block->is_free) {
+            return;
+        }
+
         AllocationStrategy block_strategy = static_cast<AllocationStrategy>(block->strategy);
+
+        #if MEMPOOL_SHARDED_SEGREGATED
+        if (block_strategy == AllocationStrategy::SEGREGATED &&
+            thread_safe &&
+            !has_scope) {
+            const size_t class_index = select_segregated_class(block->size);
+            if (class_index < SEGREGATED_CLASS_COUNT) {
+                {
+                    std::lock_guard<std::mutex> class_lock(segregated_mutexes[class_index]);
+                    if (block->is_free) {
+                        return;
+                    }
+                    block->is_free = true;
+                    block->prev = nullptr;
+                    block->next = segregated_free_lists[class_index];
+                    block->strategy = static_cast<uint8_t>(AllocationStrategy::SEGREGATED);
+                    segregated_free_lists[class_index] = block;
+                }
+                AllocationStats::deallocations++;
+                if (AllocationStats::bytes_allocated >= block->size) {
+                    AllocationStats::bytes_allocated -= block->size;
+                } else {
+                    AllocationStats::bytes_allocated = 0;
+                }
+                return;
+            }
+        }
+        #endif
         if (block_strategy == AllocationStrategy::FIXED_SIZE) {
             if (lock.owns_lock()) {
                 lock.unlock();
@@ -472,12 +646,10 @@ public:
             return;
         }
 
-        if (!lock.owns_lock()) {
+        if (thread_safe && !lock.owns_lock()) {
             lock.lock();
         }
         switch (static_cast<AllocationStrategy>(block->strategy)) {
-            case AllocationStrategy::FIXED_SIZE:
-                break;
             case AllocationStrategy::SEGREGATED:
                 {
                     const size_t class_index = select_segregated_class(block->size);
@@ -485,6 +657,9 @@ public:
                     block->prev = nullptr;
                     block->next = nullptr;
                     if (class_index < SEGREGATED_CLASS_COUNT) {
+                        #if MEMPOOL_SHARDED_SEGREGATED
+                        std::lock_guard<std::mutex> class_lock(segregated_mutexes[class_index]);
+                        #endif
                         block->strategy = static_cast<uint8_t>(AllocationStrategy::SEGREGATED);
                         block->next = segregated_free_lists[class_index];
                         segregated_free_lists[class_index] = block;
@@ -508,13 +683,14 @@ public:
     void reset() {
         std::unique_lock<std::mutex> lock(mutex, std::defer_lock);
         if (thread_safe) lock.lock();
+        // Free all chunks
+        for (auto chunk : memory_chunks) {
+            delete[] chunk;
+        }
+        memory_chunks.clear();
         free_list = nullptr;
         size_index.clear();
         size_lookup.clear();
-        for (auto chunk : memory_chunks) {
-            MemoryBlock* block = MemoryBlock::init(chunk, POOL_SIZE);
-            insert_free_block(block);
-        }
         scope_stack.clear();
         scope_lookup.clear();
         segregated_free_lists.fill(nullptr);
@@ -522,7 +698,14 @@ public:
         thread_cache.small_blocks.clear();
         thread_cache.medium_blocks.clear();
         thread_cache.large_blocks.clear();
+        small_allocator.reset();
+        medium_allocator.reset();
+        large_allocator.reset();
+        // Add fresh chunk
+        add_new_chunk();
     }
+
+    void release_thread_cache();
 
 private:
     void add_new_chunk() {
@@ -536,6 +719,7 @@ private:
     void* allocate_best_fit(size_t size);    // Implementation from original code
     void* allocate_from_pool(size_t size);   // Pool-based allocation
     void* allocate_segregated(size_t size);  // Segregated lists allocation
+    void* allocate_segregated_fast(size_t size);
     void deallocate_block(MemoryBlock* block); // Common deallocation logic
     void insert_free_block(MemoryBlock* block, AllocationStrategy strat = AllocationStrategy::BEST_FIT, bool allow_coalesce = true);
     void detach_free_block(MemoryBlock* block);
@@ -551,6 +735,8 @@ private:
         std::vector<void*> large_blocks;
     };
 
+    struct SegregatedCache;
+
     static thread_local ThreadLocalCache thread_cache;
     static constexpr size_t SMALL_CACHE_LIMIT = 256;
     static constexpr size_t MEDIUM_CACHE_LIMIT = 256;
@@ -563,9 +749,9 @@ private:
     bool release_small_to_cache(ThreadLocalCache& cache, void* ptr);
     bool release_medium_to_cache(ThreadLocalCache& cache, void* ptr);
     bool release_large_to_cache(ThreadLocalCache& cache, void* ptr);
-    void refill_small_cache(ThreadLocalCache& cache);
-    void refill_medium_cache(ThreadLocalCache& cache);
-    void refill_large_cache(ThreadLocalCache& cache);
+    bool owns_ptr(void* ptr);
+    void refill_segregated_cache(SegregatedCache& cache, size_t class_index);
+    bool release_segregated_to_cache(SegregatedCache& cache, MemoryBlock* block, size_t class_index);
 };
 
 // Thread-local storage for memory pools

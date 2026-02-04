@@ -165,3 +165,35 @@ The implementation is thread-safe through:
 - Thread-local allocation tracking
 
 This memory allocator is designed for high-performance applications requiring custom memory management with multiple allocation strategies and thread safety.
+
+## Benchmark Suite (RL/Inference Focus)
+
+This repo now includes a reproducible benchmark harness that mimics RL/inference allocation patterns (many small alloc/free, multithreaded churn, and alignment-heavy buffers).
+
+### Quick Start
+
+```
+make bench
+```
+
+### Outputs
+- CSV results: `bench/results/bench.csv`
+- Plots: `bench/plots/throughput_by_workload.png`, `bench/plots/scaling_rl_small.png`, `bench/plots/overhead_ratio.png`
+
+### Baselines
+By default, the suite compares:
+- `mempool_baseline` (segregated lists with a single lock)
+- `mempool_sharded` (segregated lists with sharded locks)
+- `system` (glibc/Apple malloc)
+
+If available, it also builds:
+- `jemalloc`
+- `tcmalloc`
+
+### Reproducibility
+- Pinned toolchain: `toolchain.lock`
+- Benchmark scripts: `scripts/run_bench.py`, `scripts/plot.py`
+- CI runs a smaller benchmark on PRs
+
+### Design Note
+See `docs/design_note.md` for allocator model, tradeoffs, and how to interpret the benchmark results.

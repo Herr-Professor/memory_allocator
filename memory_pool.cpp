@@ -140,6 +140,7 @@ void AllocationTimingStats::print_stats() {
                total_dealloc_count.load(std::memory_order_relaxed));
 }
 #endif
+// Thread-local instances: each thread gets its own pool/cache unless explicitly shared.
 thread_local MemoryPool global_pool(false);
 thread_local MemoryPool::ThreadLocalCache MemoryPool::thread_cache{};
 
@@ -206,13 +207,67 @@ void* MemoryPool::allocate_segregated(size_t size) {
         return allocate_best_fit(size);
     }
 
+    MemoryBlock* block = nullptr;
+#if MEMPOOL_SHARDED_SEGREGATED
+    bool need_refill = false;
+    {
+        std::lock_guard<std::mutex> class_lock(segregated_mutexes[class_index]);
+        if (!segregated_free_lists[class_index]) {
+            need_refill = true;
+        }
+    }
+    if (need_refill) {
+        replenish_segregated_class(class_index);
+    }
+    {
+        std::lock_guard<std::mutex> class_lock(segregated_mutexes[class_index]);
+        block = segregated_free_lists[class_index];
+        if (block) {
+            segregated_free_lists[class_index] = block->next;
+            block->next = nullptr;
+            block->prev = nullptr;
+            block->is_free = false;
+            block->strategy = static_cast<uint8_t>(AllocationStrategy::SEGREGATED);
+        }
+    }
+#else
     if (!segregated_free_lists[class_index]) {
         replenish_segregated_class(class_index);
     }
 
-    MemoryBlock* block = segregated_free_lists[class_index];
+    block = segregated_free_lists[class_index];
+    if (block) {
+        segregated_free_lists[class_index] = block->next;
+        block->next = nullptr;
+        block->prev = nullptr;
+        block->is_free = false;
+        block->strategy = static_cast<uint8_t>(AllocationStrategy::SEGREGATED);
+    }
+#endif
+
     if (!block) {
         return allocate_best_fit(size);
+    }
+
+    AllocationStats::allocations++;
+    AllocationStats::bytes_allocated += block->size;
+    return block->data();
+}
+
+void* MemoryPool::allocate_segregated_fast(size_t size) {
+#if MEMPOOL_SHARDED_SEGREGATED
+    ScopedTiming timing(TimingCategory::Segregated);
+    const size_t class_index = select_segregated_class(size);
+    if (class_index == SEGREGATED_CLASS_COUNT) {
+        // Let the caller fall back under the global lock.
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> class_lock(segregated_mutexes[class_index]);
+    MemoryBlock* block = segregated_free_lists[class_index];
+    if (!block) {
+        // Let the caller fall back under the global lock.
+        return nullptr;
     }
 
     segregated_free_lists[class_index] = block->next;
@@ -224,6 +279,10 @@ void* MemoryPool::allocate_segregated(size_t size) {
     AllocationStats::allocations++;
     AllocationStats::bytes_allocated += block->size;
     return block->data();
+#else
+    (void)size;
+    return nullptr;
+#endif
 }
 
 void MemoryPool::deallocate_block(MemoryBlock* block) {
@@ -358,6 +417,51 @@ MemoryBlock* MemoryPool::ptr_to_block(void* ptr) {
     return reinterpret_cast<MemoryBlock*>(reinterpret_cast<char*>(ptr) - sizeof(MemoryBlock));
 }
 
+bool MemoryPool::owns_ptr(void* ptr) {
+    if (!ptr) {
+        return false;
+    }
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+
+    for (const auto chunk : memory_chunks) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(chunk);
+        if (addr >= base && addr < base + POOL_SIZE) {
+            return true;
+        }
+    }
+
+    if (small_allocator.owns(ptr)) {
+        return true;
+    }
+    if (medium_allocator.owns(ptr)) {
+        return true;
+    }
+    if (large_allocator.owns(ptr)) {
+        return true;
+    }
+
+    return false;
+}
+
+void MemoryPool::release_thread_cache() {
+    ThreadLocalCache& cache = thread_cache;
+
+    for (void* ptr : cache.small_blocks) {
+        small_allocator.deallocate_raw(ptr);
+    }
+    cache.small_blocks.clear();
+
+    for (void* ptr : cache.medium_blocks) {
+        medium_allocator.deallocate_raw(ptr);
+    }
+    cache.medium_blocks.clear();
+
+    for (void* ptr : cache.large_blocks) {
+        large_allocator.deallocate_raw(ptr);
+    }
+    cache.large_blocks.clear();
+}
+
 void* MemoryPool::acquire_small_from_cache(ThreadLocalCache& cache) {
     if (cache.small_blocks.empty()) {
         refill_small_cache(cache);
@@ -484,18 +588,15 @@ bool MemoryPool::release_large_to_cache(ThreadLocalCache& cache, void* ptr) {
 void MemoryPool::refill_small_cache(ThreadLocalCache& cache) {
     constexpr size_t REFILL_BATCH = 64;
     for (size_t i = 0; i < REFILL_BATCH && cache.small_blocks.size() < SMALL_CACHE_LIMIT; ++i) {
-        void* ptr = small_allocator.allocate();
+        void* ptr = small_allocator.allocate_raw();
         if (!ptr) {
             break;
         }
         MemoryBlock* block = ptr_to_block(ptr);
-        if (AllocationStats::allocations > 0) {
-            AllocationStats::allocations--;
-        }
-        if (AllocationStats::bytes_allocated >= block->size) {
-            AllocationStats::bytes_allocated -= block->size;
-        } else {
-            AllocationStats::bytes_allocated = 0;
+        if (block) {
+            block->is_free = true;
+            block->next = nullptr;
+            block->prev = nullptr;
         }
         cache.small_blocks.push_back(ptr);
     }
@@ -504,18 +605,15 @@ void MemoryPool::refill_small_cache(ThreadLocalCache& cache) {
 void MemoryPool::refill_medium_cache(ThreadLocalCache& cache) {
     constexpr size_t REFILL_BATCH = 32;
     for (size_t i = 0; i < REFILL_BATCH && cache.medium_blocks.size() < MEDIUM_CACHE_LIMIT; ++i) {
-        void* ptr = medium_allocator.allocate();
+        void* ptr = medium_allocator.allocate_raw();
         if (!ptr) {
             break;
         }
         MemoryBlock* block = ptr_to_block(ptr);
-        if (AllocationStats::allocations > 0) {
-            AllocationStats::allocations--;
-        }
-        if (AllocationStats::bytes_allocated >= block->size) {
-            AllocationStats::bytes_allocated -= block->size;
-        } else {
-            AllocationStats::bytes_allocated = 0;
+        if (block) {
+            block->is_free = true;
+            block->next = nullptr;
+            block->prev = nullptr;
         }
         cache.medium_blocks.push_back(ptr);
     }
@@ -524,18 +622,15 @@ void MemoryPool::refill_medium_cache(ThreadLocalCache& cache) {
 void MemoryPool::refill_large_cache(ThreadLocalCache& cache) {
     constexpr size_t REFILL_BATCH = 32;
     for (size_t i = 0; i < REFILL_BATCH && cache.large_blocks.size() < LARGE_CACHE_LIMIT; ++i) {
-        void* ptr = large_allocator.allocate();
+        void* ptr = large_allocator.allocate_raw();
         if (!ptr) {
             break;
         }
         MemoryBlock* block = ptr_to_block(ptr);
-        if (AllocationStats::allocations > 0) {
-            AllocationStats::allocations--;
-        }
-        if (AllocationStats::bytes_allocated >= block->size) {
-            AllocationStats::bytes_allocated -= block->size;
-        } else {
-            AllocationStats::bytes_allocated = 0;
+        if (block) {
+            block->is_free = true;
+            block->next = nullptr;
+            block->prev = nullptr;
         }
         cache.large_blocks.push_back(ptr);
     }
@@ -562,10 +657,14 @@ void MemoryPool::replenish_segregated_class(size_t class_index) {
     detach_free_block(chunk_block);
 
     const size_t class_size = SEGREGATED_CLASS_SIZES[class_index];
+    if (chunk_block->size > std::numeric_limits<size_t>::max() - sizeof(MemoryBlock)) {
+        return;
+    }
     size_t total_bytes = chunk_block->size + sizeof(MemoryBlock);
     char* cursor = reinterpret_cast<char*>(chunk_block);
 
-    MemoryBlock* head = segregated_free_lists[class_index];
+    MemoryBlock* head = nullptr;
+    MemoryBlock* tail = nullptr;
 
     while (total_bytes >= class_size + sizeof(MemoryBlock)) {
         MemoryBlock* new_block = MemoryBlock::init(
@@ -576,11 +675,25 @@ void MemoryPool::replenish_segregated_class(size_t class_index) {
         new_block->next = head;
         new_block->prev = nullptr;
         head = new_block;
+        if (!tail) {
+            tail = new_block;
+        }
         cursor += class_size + sizeof(MemoryBlock);
         total_bytes -= class_size + sizeof(MemoryBlock);
     }
 
-    segregated_free_lists[class_index] = head;
+    if (head) {
+        #if MEMPOOL_SHARDED_SEGREGATED
+        {
+            std::lock_guard<std::mutex> class_lock(segregated_mutexes[class_index]);
+            tail->next = segregated_free_lists[class_index];
+            segregated_free_lists[class_index] = head;
+        }
+        #else
+        tail->next = segregated_free_lists[class_index];
+        segregated_free_lists[class_index] = head;
+        #endif
+    }
 
     if (total_bytes > sizeof(MemoryBlock)) {
         MemoryBlock* remainder = MemoryBlock::init(cursor, total_bytes);
