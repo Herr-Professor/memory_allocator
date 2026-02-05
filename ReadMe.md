@@ -1,8 +1,8 @@
-This is a work in progress;
+This is a research-focused allocator benchmark suite with a custom memory pool and reproducible evaluation harness.
 
-# Custom Memory Allocator
+# Custom Memory Allocator (Research Repo)
 
-A high-performance, thread-safe memory allocator implementation with multiple allocation strategies and STL container support.
+This repo implements a high-performance, thread-safe allocator with multiple strategies and a benchmark harness tailored to RL/inference allocation patterns. The benchmark suite compares this allocator against system `malloc` and (optionally) `jemalloc`/`tcmalloc`, with reproducible CSV outputs and plots.
 
 ## Features
 
@@ -70,52 +70,44 @@ STL-compatible allocator template:
 - Integration with thread-local memory pools
 - Exception safety
 
-## Tests
+## Benchmark Suite (RL/Inference Focus)
 
-### Basic Memory Operations (test1.cpp)
-A simple test that demonstrates basic memory pool operations:
-- Single block allocation and deallocation
-- Memory reuse verification
-- Basic cleanup operations
+The benchmark harness lives under `bench/` and is designed to mimic RL/inference allocation patterns (many small alloc/free, multithreaded churn, alignment-heavy buffers).
 
-### Stress Test (test2.cpp)
-A comprehensive stress test that validates:
-- Large-scale allocations (1000 initial blocks)
-- Random allocation patterns (5000 operations)
-- Memory reuse efficiency
-- Variable block sizes (16-256 bytes)
-- Three types of operations:
-  - New allocations (A)
-  - Deallocations (D)
-  - Reallocations (R)
-- Memory statistics tracking
-- Proper cleanup of all allocated blocks
+### Quick Start (paper-grade)
+```
+make bench
+```
 
-The stress test provides visual feedback of operations and periodic statistics reporting, helping identify potential issues with:
-- Memory fragmentation
-- Memory leaks
-- Free list management
-- Memory reuse efficiency
-- Thread safety
+### Resume (long runs)
+```
+make bench_resume
+```
 
-### Performance Comparison Test (test3.cpp)
-A comprehensive benchmark that:
-- Compares MemoryPool against standard malloc/free
-- Performs 10,000 initial allocations
-- Executes 50,000 random operations
-- Tracks and visualizes:
-  - Memory usage with ASCII progress bars
-  - Real-time allocation (R) and deallocation (D) operations
-  - Peak memory usage
-  - Total execution time
-  - Average operation time
-  - Allocation/deallocation counts
+### Smoke run (fast)
+```
+make bench_smoke
+```
 
-The test helps identify:
-- Performance differences between allocators
-- Memory usage patterns
-- Memory fragmentation effects
-- Allocation/deallocation efficiency
+### Outputs
+- CSV: `bench/results/bench.csv`
+- Plots: `bench/plots/throughput_by_workload.png`, `bench/plots/scaling_rl_small.png`, `bench/plots/overhead_ratio.png`
+
+### Baselines
+By default the suite compares:
+- `system` (glibc/Apple malloc)
+- `mempool_baseline`
+- `mempool_sharded`
+
+If available, it also builds:
+- `jemalloc`
+- `tcmalloc`
+
+### Timeouts
+Paper runs can be long. The default per-config timeout is **1200s**. Override via:
+```
+make bench BENCH_TIMEOUT=1800
+```
 
 ## Best Practices
 
@@ -164,7 +156,27 @@ The implementation is thread-safe through:
 - Atomic counters for statistics
 - Thread-local allocation tracking
 
-This memory allocator is designed for high-performance applications requiring custom memory management with multiple allocation strategies and thread safety.
+This allocator is designed for high-performance applications requiring custom memory management with multiple allocation strategies and thread safety.
+
+## Repo Structure
+- `memory_pool.h/.cpp`: allocator implementation
+- `bench/`: benchmark harness + allocator adapters
+- `scripts/`: bench runner + plotting
+- `docs/design_note.md`: 2–4 page design note and results
+- `Makefile`: build + bench targets
+
+## Reproduction
+To make results comparable, record the following in your report or README:
+- **Compiler**: `c++ --version` (or `clang++ --version`)
+- **OS**: `uname -a`
+- **CPU**: `sysctl -n machdep.cpu.brand_string` (macOS) or `lscpu` (Linux)
+- **Build flags**: see `Makefile` and `toolchain.lock`
+
+## Known Issues
+- **Sharded variant slowdown**: On higher thread counts and mixed-size workloads, `mempool_sharded` can be significantly slower than `mempool_baseline`. This is a real benchmark result; see `docs/design_note.md` for measured deltas and interpretation.
+
+## Design Note
+See `docs/design_note.md` for the allocator model, tradeoffs, and benchmark interpretation.
 
 ## Benchmark Suite (RL/Inference Focus)
 

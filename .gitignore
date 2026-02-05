@@ -14,12 +14,8 @@ test2
 test3
 main
 
-# Benchmark results
-bench/results/
-bench/plots/*.png
-bench/plots/*.pdf
-
 # IDE
+.github/
 .vscode/
 .idea/
 *.swp
@@ -36,6 +32,16 @@ __pycache__/
 *.pyo
 .pytest_cache/
 *.egg-info/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+
+# Logs
+*.log
+
+# macOS debug symbols
+*.dSYM/
 
 # CMake (if ever added)
 CMakeCache.txt

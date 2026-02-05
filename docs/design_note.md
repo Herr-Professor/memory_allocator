@@ -37,18 +37,18 @@ Each workload runs across multiple thread counts and records:
 - **Fragmentation proxy** (usable/requested ratio)
 - **Peak live bytes**
 
-## Results Summary (to be generated)
+## Results Summary
 Run `make bench` to produce `bench/results/bench.csv` and plots in `bench/plots/`.
 
-### Results Summary (run: February 4, 2026; BENCH_OPS=20000, BENCH_THREADS=1,2)
-These numbers are from `bench/results/bench.csv` on a short run (20k ops, 1–2 threads). At 2 threads:
-- **`rl_small` throughput**: system `1.542e7 ops/s`, mempool_baseline `8.865e6`, mempool_sharded `3.840e6`. p99 alloc/free for baseline is `42/42 ns`, sharded `83/6958 ns`.
-- **`rl_medium` throughput**: system `1.105e7 ops/s`, mempool_baseline `3.620e6`, mempool_sharded `2.175e6`. p99 alloc/free for baseline `458/417 ns`, sharded `5083/1958 ns`.
-- **`fragmentation_mix` throughput**: system `1.632e7 ops/s`, mempool_baseline `3.913e6`, mempool_sharded `2.774e6`. p99 alloc/free for baseline `375/6125 ns`, sharded `3500/13250 ns`.
-- **`alignment64` throughput**: system `1.456e7 ops/s`, mempool_baseline `5.287e6`, mempool_sharded `4.534e6`. p99 alloc/free for baseline `250/1083 ns`, sharded `166/4458 ns`.
-- **Fragmentation proxy (avg usable/requested)**: baseline and sharded are similar within each workload; e.g. `rl_small` ~`1.17`, `rl_medium` ~`1.00`, `fragmentation_mix` ~`1.01`, `alignment64` ~`1.72`.
+### Results Summary (run: February 5, 2026; BENCH_OPS=200000, BENCH_THREADS=1,2,4,8)
+These numbers are from `bench/results/bench.csv` on the paper‑grade run (200k ops, 1–8 threads). At 8 threads:
+- **`rl_small` throughput**: system `2.554e7 ops/s`, mempool_baseline `2.697e6`, mempool_sharded `3.454e6`. p99 alloc/free: baseline `2750/98459 ns`, sharded `209/88792 ns`.
+- **`rl_medium` throughput**: system `1.696e7 ops/s`, mempool_baseline `7.083e5`, mempool_sharded `7.917e5`. p99 alloc/free: baseline `172500/332333 ns`, sharded `162708/243959 ns`.
+- **`fragmentation_mix` throughput**: system `1.047e7 ops/s`, mempool_baseline `2.130e5`, mempool_sharded `2.528e5`. p99 alloc/free: baseline `484584/851417 ns`, sharded `341292/747833 ns`.
+- **`alignment64` throughput**: system `1.959e7 ops/s`, mempool_baseline `1.158e6`, mempool_sharded `1.158e6`. p99 alloc/free: baseline `79084/161541 ns`, sharded `58666/189625 ns`.
+- **Fragmentation proxy (avg usable/requested)**: baseline and sharded are similar within each workload; e.g. `rl_small` ~`1.18`, `rl_medium` ~`1.00`, `fragmentation_mix` ~`1.01`, `alignment64` ~`1.71`.
 
-**Interpretation:** In this short 1–2 thread run, the sharded segregated path underperformed the baseline in throughput and tail latency. This suggests the extra class‑lock overhead is not paying off at low thread counts, or the sharded fast path is not yet tuned (e.g., refill strategy). Re‑run with higher thread counts and longer ops to validate scaling before drawing final conclusions.
+**Interpretation:** At 8 threads, the sharded variant improves throughput slightly over baseline across the RL/inference‑style workloads, but both remain far below system malloc and exhibit very high tail latencies, especially in `rl_medium` and `fragmentation_mix`. This is a clear negative result: sharded locks reduce some contention but do not solve the core throughput/latency gap.
 
 ### Surprises / Notes
 - Document any unexpected regressions, e.g. alignment-heavy workloads or specific size-class anomalies.
