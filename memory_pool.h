@@ -749,6 +749,9 @@ private:
     bool release_small_to_cache(ThreadLocalCache& cache, void* ptr);
     bool release_medium_to_cache(ThreadLocalCache& cache, void* ptr);
     bool release_large_to_cache(ThreadLocalCache& cache, void* ptr);
+    void refill_small_cache(ThreadLocalCache& cache);
+    void refill_medium_cache(ThreadLocalCache& cache);
+    void refill_large_cache(ThreadLocalCache& cache);
     bool owns_ptr(void* ptr);
     void refill_segregated_cache(SegregatedCache& cache, size_t class_index);
     bool release_segregated_to_cache(SegregatedCache& cache, MemoryBlock* block, size_t class_index);

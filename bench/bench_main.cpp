@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 #if defined(ALLOCATOR_SYSTEM)
 #include "allocators/system.h"
@@ -236,12 +239,51 @@ static void print_csv_header() {
               << "peak_live_requested,peak_live_usable,alignment" << std::endl;
 }
 
+static std::unordered_set<std::string> load_completed(const std::string& path) {
+    std::unordered_set<std::string> completed;
+    if (path.empty()) {
+        return completed;
+    }
+
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return completed;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("allocator,", 0) == 0) {
+            continue;
+        }
+        if (line.empty()) {
+            continue;
+        }
+        std::vector<std::string> fields;
+        std::stringstream ss(line);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            fields.push_back(item);
+        }
+        if (fields.size() < 5) {
+            continue;
+        }
+        const std::string& allocator = fields[0];
+        const std::string& workload = fields[1];
+        const std::string& threads = fields[2];
+        const std::string& ops = fields[3];
+        completed.insert(allocator + "|" + workload + "|" + threads + "|" + ops);
+    }
+
+    return completed;
+}
+
 int main(int argc, char** argv) {
     uint64_t ops_per_thread = 200000;
     std::vector<int> thread_counts = {1, 2, 4, 8};
     std::vector<std::string> workload_names;
     uint64_t seed = 42;
     bool print_header = true;
+    std::string resume_csv;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strncmp(argv[i], "--ops=", 6) == 0) {
@@ -254,6 +296,8 @@ int main(int argc, char** argv) {
             seed = std::stoull(argv[i] + 7);
         } else if (std::strcmp(argv[i], "--no-header") == 0) {
             print_header = false;
+        } else if (std::strncmp(argv[i], "--resume-csv=", 13) == 0) {
+            resume_csv = argv[i] + 13;
         }
     }
 
@@ -268,6 +312,8 @@ int main(int argc, char** argv) {
         print_csv_header();
     }
 
+    std::unordered_set<std::string> completed = load_completed(resume_csv);
+
     for (const auto& workload_name : workload_names) {
         const WorkloadSpec* spec = find_workload(workloads, workload_name);
         if (!spec) {
@@ -276,6 +322,16 @@ int main(int argc, char** argv) {
         }
 
         for (int threads : thread_counts) {
+            const std::string key = std::string(allocator_name()) + "|" + spec->name + "|" +
+                                    std::to_string(threads) + "|" + std::to_string(ops_per_thread);
+            if (!resume_csv.empty() && completed.find(key) != completed.end()) {
+                std::cerr << "[bench] skip allocator=" << allocator_name()
+                          << " workload=" << spec->name
+                          << " threads=" << threads
+                          << " ops=" << ops_per_thread
+                          << std::endl;
+                continue;
+            }
             std::cerr << "[bench] start allocator=" << allocator_name()
                       << " workload=" << spec->name
                       << " threads=" << threads

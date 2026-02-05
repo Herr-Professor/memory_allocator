@@ -3,6 +3,7 @@ import argparse
 import csv
 import datetime
 import os
+import time
 import subprocess
 import sys
 import threading
@@ -13,8 +14,63 @@ def parse_list(value):
         return []
     return [item.strip() for item in value.split(',') if item.strip()]
 
-def run_binary(binary, threads, ops, workloads, seed):
+def allocator_label(binary):
+    name = binary.name
+    if "bench_system" in name:
+        return "system"
+    if "bench_mempool_baseline" in name:
+        return "mempool_baseline"
+    if "bench_mempool_sharded" in name:
+        return "mempool_sharded"
+    if "bench_jemalloc" in name:
+        return "jemalloc"
+    if "bench_tcmalloc" in name:
+        return "tcmalloc"
+    return name
+
+
+def load_completed_csv(path):
+    completed = set()
+    if not path or not Path(path).exists():
+        return completed
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or row[0] == "allocator":
+                continue
+            if len(row) < 4:
+                continue
+            completed.add(f"{row[0]}|{row[1]}|{row[2]}|{row[3]}")
+    return completed
+
+
+def write_timeout_row(writer, csv_file, allocator, workload, threads, ops, alignment, timeout_s):
+    total_ops = int(threads) * int(ops)
+    row = [
+        allocator,
+        workload,
+        str(threads),
+        str(ops),
+        str(total_ops),
+        str(float(timeout_s)),
+        str(0.0),
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        str(alignment),
+    ]
+    writer.writerow(row)
+    csv_file.flush()
+
+
+def run_binary(binary, threads, ops, workloads, seed, resume_csv, writer, csv_file, header_len, timeout_s):
     cmd = [str(binary), f"--threads={threads}", f"--ops={ops}", f"--workloads={workloads}", f"--seed={seed}", "--no-header"]
+    if resume_csv:
+        cmd.append(f"--resume-csv={resume_csv}")
     start = datetime.datetime.utcnow()
     print(f"[bench] running {binary} threads={threads} ops={ops} workloads={workloads}", file=sys.stderr, flush=True)
     
@@ -30,8 +86,34 @@ def run_binary(binary, threads, ops, workloads, seed):
     stderr_thread = threading.Thread(target=read_stderr)
     stderr_thread.start()
 
-    stdout = proc.stdout.read()
-    proc.wait()
+    timed_out = False
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line or line.startswith("allocator,"):
+                continue
+            row = line.split(',')
+            if len(row) != header_len:
+                sys.stderr.write(f"[bench] Skipping malformed row: {row}\n")
+                continue
+            writer.writerow(row)
+            csv_file.flush()
+        if timeout_s:
+            proc.wait(timeout=timeout_s)
+        else:
+            proc.wait()
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        proc.wait()
+        raise
     stderr_thread.join()
     stderr = "".join(stderr_lines)
     
@@ -41,15 +123,12 @@ def run_binary(binary, threads, ops, workloads, seed):
         print(f"[bench] finished {binary} in {duration:.2f}s OK", file=sys.stderr, flush=True)
     else:
         print(f"[bench] failed {binary} in {duration:.2f}s FAIL", file=sys.stderr, flush=True)
+    if timed_out:
+        sys.stderr.write(f"[bench] timeout after {timeout_s}s for {binary}\n")
+        return "timeout"
     if proc.returncode != 0:
-        return []
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    rows = []
-    for line in lines:
-        if line.startswith("allocator,"):
-            continue
-        rows.append(line.split(','))
-    return rows
+        return False
+    return True
 
 
 def main():
@@ -60,6 +139,8 @@ def main():
     parser.add_argument("--ops", default="200000", help="Operations per thread")
     parser.add_argument("--workloads", default="rl_small,rl_medium,fragmentation_mix,alignment64", help="Comma-separated workloads")
     parser.add_argument("--seed", default="42")
+    parser.add_argument("--resume", action="store_true", help="Append to existing CSV and skip completed configs")
+    parser.add_argument("--timeout", type=int, default=0, help="Per-config timeout in seconds (0 = no timeout)")
     args = parser.parse_args()
 
     bins = [Path(p) for p in parse_list(args.bins)]
@@ -88,22 +169,55 @@ def main():
         "alignment",
     ]
 
-    all_rows = []
-    for binary in bins:
-        if not binary.exists():
-            sys.stderr.write(f"[bench] Skipping missing binary: {binary}\n")
-            continue
-        rows = run_binary(binary, args.threads, args.ops, args.workloads, args.seed)
-        all_rows.extend(rows)
+    resume_csv = ""
+    completed = set()
+    if args.resume:
+        resume_csv = str(out_path)
+        completed = load_completed_csv(resume_csv)
 
-    with out_path.open("w", newline="") as f:
+    write_header = True
+    if resume_csv and out_path.exists():
+        write_header = False
+
+    with out_path.open("a" if not write_header else "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(header)
-        for row in all_rows:
-            if len(row) != len(header):
-                sys.stderr.write(f"[bench] Skipping malformed row: {row}\n")
-                continue
-            writer.writerow(row)
+        if write_header:
+            writer.writerow(header)
+            f.flush()
+        try:
+            if args.timeout > 0:
+                thread_list = [int(t) for t in parse_list(args.threads)]
+                workload_list = parse_list(args.workloads)
+                for binary in bins:
+                    if not binary.exists():
+                        sys.stderr.write(f"[bench] Skipping missing binary: {binary}\n")
+                        continue
+                    allocator = allocator_label(binary)
+                    for workload in workload_list:
+                        for threads in thread_list:
+                            key = f"{allocator}|{workload}|{threads}|{args.ops}"
+                            if key in completed:
+                                sys.stderr.write(f"[bench] Skipping completed {key}\n")
+                                continue
+                            ok = run_binary(binary, str(threads), args.ops, workload, args.seed,
+                                            resume_csv, writer, f, len(header), args.timeout)
+                            if ok == "timeout":
+                                alignment = 64 if workload == "alignment64" else 0
+                                write_timeout_row(writer, f, allocator, workload, threads, args.ops, alignment, args.timeout)
+                            elif ok is False:
+                                sys.stderr.write(f"[bench] {binary} failed; continuing.\n")
+            else:
+                for binary in bins:
+                    if not binary.exists():
+                        sys.stderr.write(f"[bench] Skipping missing binary: {binary}\n")
+                        continue
+                    ok = run_binary(binary, args.threads, args.ops, args.workloads, args.seed,
+                                    resume_csv, writer, f, len(header), 0)
+                    if not ok:
+                        sys.stderr.write(f"[bench] {binary} failed; continuing.\n")
+        except KeyboardInterrupt:
+            sys.stderr.write("\n[bench] Interrupted; partial results saved.\n")
+            return 130
 
     meta_path = out_path.parent / "bench_meta.txt"
     with meta_path.open("w") as f:

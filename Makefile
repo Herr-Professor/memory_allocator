@@ -24,6 +24,7 @@ ifeq ($(TCMALLOC_LIBS),)
 endif
 
 BENCH_OPS ?= 200000
+BENCH_TIMEOUT ?= 1200
 BENCH_THREADS ?= 1,2,4,8,16
 BENCH_WORKLOADS ?= rl_small,rl_medium,fragmentation_mix,alignment64
 
@@ -60,7 +61,11 @@ $(BUILD_DIR)/bench_tcmalloc: $(BENCH_SRC) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(TCMALLOC_CFLAGS) -DALLOCATOR_TCMALLOC -o $@ $< $(TCMALLOC_LIBS)
 
 bench: $(BENCH_BINARIES)
-	python3 scripts/run_bench.py --bins $(BENCH_BINS_CSV) --threads $(BENCH_THREADS) --ops $(BENCH_OPS) --workloads $(BENCH_WORKLOADS)
+	python3 scripts/run_bench.py --bins $(BENCH_BINS_CSV) --threads $(BENCH_THREADS) --ops $(BENCH_OPS) --workloads $(BENCH_WORKLOADS) --timeout $(BENCH_TIMEOUT)
+	python3 scripts/plot.py --csv bench/results/bench.csv --out bench/plots
+
+bench_resume: $(BENCH_BINARIES)
+	python3 scripts/run_bench.py --bins $(BENCH_BINS_CSV) --threads $(BENCH_THREADS) --ops $(BENCH_OPS) --workloads $(BENCH_WORKLOADS) --resume --timeout $(BENCH_TIMEOUT)
 	python3 scripts/plot.py --csv bench/results/bench.csv --out bench/plots
 
 bench_smoke: $(BENCH_BINARIES)
@@ -72,4 +77,4 @@ bench-fast: bench_smoke
 clean:
 	rm -rf $(BUILD_DIR) bench/results/bench.csv bench/results/bench_meta.txt bench/plots/*.png
 
-.PHONY: all bench bench_smoke bench-fast clean
+.PHONY: all bench bench_resume bench_smoke bench-fast clean
